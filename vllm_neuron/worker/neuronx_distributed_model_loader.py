@@ -201,14 +201,14 @@ class NeuronModelBase(nn.Module):
             path = Path(model_name_or_path
                         ) / "neuron-compiled-artifacts" / hashed_config
             path.mkdir(parents=True, exist_ok=True)
-            shutil.rmtree(path, ignore_errors=True)
+            # shutil.rmtree(path, ignore_errors=True)
             return path
         else:
             path = Path(
                 "local-models"
             ) / model_name_or_path / "neuron-compiled-artifacts" / hashed_config
             path.mkdir(parents=True, exist_ok=True)
-            shutil.rmtree(path, ignore_errors=True)
+            # shutil.rmtree(path, ignore_errors=True)
             return path
 
     def _load_compiled_model(self, compiled_model_path: str, neuronx_model_cls,
