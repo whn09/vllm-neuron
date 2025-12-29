@@ -687,14 +687,34 @@ class NeuronQwen2VLForCausalLM(NeuronMultiModalCausalLM):
         if input_ids.shape[0] != sampling_params.shape[0]:
             sampling_params = sampling_params[:input_ids.shape[0]]
 
-        return self.model(
-            input_ids=input_ids,
-            position_ids=positions,
-            sampling_params=sampling_params,
-            pixel_values=pixel_values,
-            vision_mask=vision_mask,
-            image_grid_thw=image_grid_thw,
-            **kwargs)
+        # Use _reordered context manager for proper seq_ids handling
+        with self._reordered(
+                input_block_ids,
+                input_ids=input_ids,
+                positions=positions,
+                sampling_params=sampling_params,
+                pixel_values=pixel_values,
+                vision_mask=vision_mask,
+                image_grid_thw=image_grid_thw,
+                **kwargs,
+        ) as (sorted_ids, inputs, restore):
+            output = self.model(
+                input_ids=inputs["input_ids"].to(torch.int32),
+                attention_mask=None,
+                position_ids=inputs["positions"].to(torch.int32),
+                seq_ids=sorted_ids.flatten().to(torch.int32),
+                sampling_params=inputs["sampling_params"],
+                pixel_values=inputs.get("pixel_values"),
+                vision_mask=inputs.get("vision_mask"),
+                image_grid_thw=inputs.get("image_grid_thw"),
+            )
+
+            if self.model.config.neuron_config.on_device_sampling_config:
+                output = output.hidden_states
+            else:
+                output = output.logits[:, -1, :]
+
+            return restore(output)
 
 
 def _get_model_configs(config: PretrainedConfig) -> str:
