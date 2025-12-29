@@ -616,6 +616,87 @@ class NeuronLlama4ForCausalLM(NeuronMultiModalCausalLM):
                                **kwargs)
 
 
+class NeuronQwen2VLForCausalLM(NeuronMultiModalCausalLM):
+    """Neuron model wrapper for Qwen2-VL vision-language model."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.image_token_id = None
+
+    def load_weights(self, model_name_or_path: str, architecture: str,
+                     **kwargs):
+        success, compiled_model_path = super().load_weights(
+            model_name_or_path, architecture, **kwargs)
+
+        # Get image token ID from model config
+        self.image_token_id = getattr(self.model.config, 'image_token_id', None)
+        if self.image_token_id is None:
+            # Fallback: try to get from tokenizer
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+            self.image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        return success, compiled_model_path
+
+    def execute_model(self, model_input):
+        """Helper to run model with defaults for missing multimodal inputs."""
+        vision_mask = (model_input.input_tokens ==
+                       self.image_token_id).unsqueeze(-1)
+
+        # Get image_grid_thw from multi_modal_kwargs if available
+        image_grid_thw = None
+        if model_input.multi_modal_kwargs is not None:
+            image_grid_thw = model_input.multi_modal_kwargs.get("image_grid_thw")
+
+        return super().execute_model(model_input,
+                                     vision_mask=vision_mask,
+                                     image_grid_thw=image_grid_thw)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        input_block_ids: torch.Tensor,
+        sampling_params: torch.Tensor,
+        pixel_values: torch.Tensor | None = None,
+        vision_mask: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Forward pass with multimodal support for Qwen2-VL."""
+
+        if pixel_values is not None:
+            logger.debug(f"pixel_values.shape (original) = {pixel_values.shape}")
+            # Cast to model's expected dtype
+            pixel_values = pixel_values.to(
+                self.model.vision_config.neuron_config.torch_dtype)
+
+            # vLLM sends pixel_values as 3D [seq, patches, embed_dim], but NxDI expects 2D [total_pixels, embed_dim]
+            # Reshape if needed
+            if pixel_values.dim() == 3:
+                # Flatten first two dimensions: [seq, patches, embed_dim] -> [seq * patches, embed_dim]
+                pixel_values = pixel_values.reshape(-1, pixel_values.shape[-1])
+                logger.debug(f"pixel_values.shape (reshaped) = {pixel_values.shape}")
+
+        if pixel_values is not None and vision_mask is None:
+            vision_mask = (input_ids == self.image_token_id).unsqueeze(-1)
+
+        if vision_mask is not None:
+            vision_mask = vision_mask.to(torch.bool)
+
+        # Ensure sampling params match input batch size
+        if input_ids.shape[0] != sampling_params.shape[0]:
+            sampling_params = sampling_params[:input_ids.shape[0]]
+
+        return self.model(
+            input_ids=input_ids,
+            position_ids=positions,
+            sampling_params=sampling_params,
+            pixel_values=pixel_values,
+            vision_mask=vision_mask,
+            image_grid_thw=image_grid_thw,
+            **kwargs)
+
+
 def _get_model_configs(config: PretrainedConfig) -> str:
     logger.debug(f"PretrainedConfig: {config}")
 
@@ -654,6 +735,12 @@ def _get_neuron_model_cls(architecture: str):
             if model == "qwen3moe":
                 model = "qwen3_moe"
 
+            if model == "qwen2vl":
+                model = "qwen2_vl"
+
+            if model == "qwen25vl":
+                model = "qwen2_5_vl"
+
             if architecture == "LlavaForConditionalGeneration":
                 model = "pixtral"
 
@@ -680,6 +767,8 @@ def get_neuron_model(model_config: ModelConfig,
         model = NeuronPixtralForCausalLM(model_config.hf_config)
     elif architecture == "Llama4ForConditionalGeneration":
         model = NeuronLlama4ForCausalLM(model_config.hf_config)
+    elif architecture in ("Qwen2VLForConditionalGeneration", "Qwen2_5_VLForConditionalGeneration"):
+        model = NeuronQwen2VLForCausalLM(model_config.hf_config)
     else:
         model = NeuronCausalLM(model_config.hf_config)
 

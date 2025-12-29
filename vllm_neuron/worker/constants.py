@@ -3,7 +3,8 @@ import torch
 
 NEURON_MULTI_MODAL_MODELS = [
     "MllamaForConditionalGeneration", "LlavaForConditionalGeneration",
-    "Llama4ForConditionalGeneration"
+    "Llama4ForConditionalGeneration", "Qwen2VLForConditionalGeneration",
+    "Qwen2_5_VLForConditionalGeneration"
 ]
 
 TORCH_DTYPE_TO_NEURON_AMP = {

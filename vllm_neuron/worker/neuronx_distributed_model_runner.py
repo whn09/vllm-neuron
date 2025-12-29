@@ -705,6 +705,9 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
         elif self.model.model.config.model_type == 'llama4':
             mm_data_neuron = self._process_multi_modal_data_neuron_llama4(
                 mm_data)
+        elif self.model.model.config.model_type in ('qwen2_vl', 'qwen2_5_vl'):
+            mm_data_neuron = self._process_multi_modal_data_neuron_qwen2_vl(
+                mm_data)
         else:
             raise NotImplementedError(
                 f"processing mm data for model type {self.model.model.config.model_type} not supported on Neuron yet!"
@@ -767,7 +770,7 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
 
     def _process_multi_modal_data_neuron_llama4(self, mm_data):
         """
-        Extract data from MultiModalFieldElem to adapt to the data format in _try_stack() of vllm/multimodal/inputs.py 
+        Extract data from MultiModalFieldElem to adapt to the data format in _try_stack() of vllm/multimodal/inputs.py
         """
         for k, v in mm_data.items():
             if isinstance(v, MultiModalFieldElem):
@@ -775,6 +778,19 @@ class NeuronxDistributedModelRunner(LoRAModelRunnerMixin):
                 mm_data[k] = v.data
         logger.debug(
             f"mm_data in _process_multi_modal_data_neuron_llama4: {mm_data}")
+        return mm_data
+
+    def _process_multi_modal_data_neuron_qwen2_vl(self, mm_data):
+        """
+        Process multimodal data for Qwen2-VL and Qwen2.5-VL models.
+        Expects pixel_values and image_grid_thw in mm_data.
+        """
+        for k, v in mm_data.items():
+            if isinstance(v, MultiModalFieldElem):
+                assert k == v.key, f"the key of mm_inputs is not the same as the key in it's MultiModalFieldElem. {k} != {v.key}"
+                mm_data[k] = v.data
+        logger.debug(
+            f"mm_data in _process_multi_modal_data_neuron_qwen2_vl: {mm_data}")
         return mm_data
 
     def _prepare_chunked_prefill_inputs(
