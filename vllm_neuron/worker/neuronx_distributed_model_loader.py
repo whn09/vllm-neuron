@@ -162,9 +162,15 @@ class NeuronModelBase(nn.Module):
         neuron_config = neuronx_model_cls.get_neuron_config_cls()(
             **kwargs['neuron_config'])
 
+        # Use pre-loaded hf_config if available (loaded by vLLM with trust_remote_code=True)
+        # to avoid NxDI calling AutoConfig.from_pretrained without trust_remote_code
+        hf_config = kwargs.get('hf_config')
+        if hf_config is not None:
+            load_config_fn = load_pretrained_config(hf_config=hf_config)
+        else:
+            load_config_fn = load_pretrained_config(model_name_or_path)
         config = kwargs.get('config') or neuronx_model_cls.get_config_cls()(
-            neuron_config,
-            load_config=load_pretrained_config(model_name_or_path))
+            neuron_config, load_config=load_config_fn)
 
         # If fused speculation is enabled, attach the draft model config.
         if getattr(neuron_config, "enable_fused_speculation", False):
@@ -226,7 +232,8 @@ class NeuronModelBase(nn.Module):
             )
 
     def _save_pretrained_model(self, model_name: str):
-        hf_model = AutoModelForCausalLM.from_pretrained(model_name)
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model_name, trust_remote_code=True)
         saved_path = os.path.join("local-models", model_name)
         hf_model.save_pretrained(saved_path)
         return saved_path
@@ -434,10 +441,16 @@ class NeuronMultiModalCausalLM(NeuronCausalLM):
         text_neuron_config = neuronx_model_cls.get_neuron_config_cls()(
             **text_neuron_config)
 
+        # Use pre-loaded hf_config if available (loaded by vLLM with trust_remote_code=True)
+        hf_config = kwargs.get('hf_config')
+        if hf_config is not None:
+            load_config_fn = load_pretrained_config(hf_config=hf_config)
+        else:
+            load_config_fn = load_pretrained_config(model_name_or_path)
         config = neuronx_model_cls.get_config_cls()(
             text_neuron_config=text_neuron_config,
             vision_neuron_config=vision_neuron_config,
-            load_config=load_pretrained_config(model_name_or_path))
+            load_config=load_config_fn)
 
         # Pixtral model could hit OOB error when BS > 4
         if architecture == "LlavaForConditionalGeneration":
@@ -576,7 +589,8 @@ class NeuronLlama4ForCausalLM(NeuronMultiModalCausalLM):
 
         # Load tokenizer to get vision token ID
         from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name_or_path, trust_remote_code=True)
         self.vision_token_id = tokenizer("<|image|>",
                                          add_special_tokens=False).input_ids[0]
         return success, compiled_model_path
@@ -657,6 +671,10 @@ def _get_neuron_model_cls(architecture: str):
             if architecture == "LlavaForConditionalGeneration":
                 model = "pixtral"
 
+            # MiMo is based on Qwen2 architecture, map it to qwen2
+            if model == "mimo":
+                model = "qwen2"
+
             return MODEL_TYPES[model][task]
         else:
             raise KeyError
@@ -715,7 +733,8 @@ def get_neuron_model(model_config: ModelConfig,
                        architecture=architecture,
                        neuron_config=neuron_config,
                        override_neuron_config=override_neuron_config,
-                       speculative_config=speculative_config)
+                       speculative_config=speculative_config,
+                       hf_config=model_config.hf_config)
     model.neuron_config = model.model.config.neuron_config
     model.architecture = architecture
     model.num_key_value_heads = num_key_value_heads
