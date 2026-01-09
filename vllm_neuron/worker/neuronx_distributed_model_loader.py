@@ -39,7 +39,7 @@ from neuronx_distributed_inference.modules.lora_serving import \
 from neuronx_distributed_inference.utils.constants import MODEL_TYPES
 from neuronx_distributed_inference.utils.hf_adapter import \
     load_pretrained_config
-from transformers import AutoModelForCausalLM, PretrainedConfig
+from transformers import PretrainedConfig
 from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
                          SchedulerConfig, SpeculativeConfig)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -231,12 +231,13 @@ class NeuronModelBase(nn.Module):
                 "Using pre-compiled artifacts, override_neuron_config will be ignored"
             )
 
-    def _save_pretrained_model(self, model_name: str):
-        hf_model = AutoModelForCausalLM.from_pretrained(
-            model_name, trust_remote_code=True)
-        saved_path = os.path.join("local-models", model_name)
-        hf_model.save_pretrained(saved_path)
-        return saved_path
+    def _get_model_path(self, model_name: str):
+        """Get local path for model, using HuggingFace cache if available."""
+        from huggingface_hub import snapshot_download
+        # snapshot_download returns the cached path if already downloaded,
+        # or downloads and returns the path if not cached.
+        # This avoids loading the full model into memory.
+        return snapshot_download(repo_id=model_name)
 
     def _compile_and_load_model(self, model_path: str, neuronx_model_cls,
                                 config, compiled_path: str):
@@ -396,8 +397,7 @@ class NeuronCausalLM(NeuronModelBase):
 
         if not success:
             if not os.path.exists(model_name_or_path):
-                model_name_or_path = self._save_pretrained_model(
-                    model_name_or_path)
+                model_name_or_path = self._get_model_path(model_name_or_path)
             self._compile_and_load_model(model_name_or_path, neuronx_model_cls,
                                          config, compiled_model_path)
         return success, compiled_model_path
@@ -464,8 +464,7 @@ class NeuronMultiModalCausalLM(NeuronCausalLM):
 
         if not success:
             if not os.path.exists(model_name_or_path):
-                model_name_or_path = self._save_pretrained_model(
-                    model_name_or_path)
+                model_name_or_path = self._get_model_path(model_name_or_path)
 
             self._compile_and_load_model(model_name_or_path, neuronx_model_cls,
                                          config, compiled_model_path)
