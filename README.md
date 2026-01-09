@@ -40,6 +40,7 @@ The following models are supported on vLLM with NxD Inference:
 - Llama 4 Scout, Maverick
 - Qwen 2.5
 - Qwen 3
+- MiMo (XiaomiMiMo/MiMo-7B-SFT)
 - Pixtral (limited, see Known Issues)
 
 
@@ -71,7 +72,7 @@ For a complete step-by-step tutorial on deploying the vLLM Neuron DLC, see the [
 Install the plugin from GitHub sources using the following commands. The plugin will automatically install the correct version of vLLM along with other required dependencies.
 
 ```bash
-git clone --branch "0.2.2+lts" https://github.com/vllm-project/vllm-neuron.git
+git clone --branch "feature/mimo-support" https://github.com/whn09/vllm-neuron.git
 cd vllm-neuron
 pip install --extra-index-url=https://pip.repos.neuron.amazonaws.com -e .
 ```
