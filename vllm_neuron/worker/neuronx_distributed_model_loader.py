@@ -964,6 +964,9 @@ def _get_neuron_model_cls(architecture: str):
             if model == "qwen3moe":
                 model = "qwen3_moe"
 
+            if model == "seedoss":
+                model = "seed_oss"
+
             if model == "qwen2vl":
                 model = "qwen2_vl"
 
