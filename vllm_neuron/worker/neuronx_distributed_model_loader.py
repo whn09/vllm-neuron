@@ -62,6 +62,40 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
+def _patch_qwen3_load_hf_model():
+    """
+    Monkey-patch NxDI's Qwen3 load_hf_model to handle tie_word_embeddings issue.
+
+    The Qwen3 model has tie_word_embeddings=True by default, which causes
+    a "Cannot copy out of meta tensor" error when loading with NxDI's
+    init_on_device context manager. This patch disables tie_word_embeddings
+    during HF model loading to avoid the error.
+    """
+    try:
+        from neuronx_distributed_inference.models.qwen3.modeling_qwen3 import (
+            NeuronQwen3ForCausalLM)
+        from transformers import Qwen3ForCausalLM
+
+        original_load_hf_model = NeuronQwen3ForCausalLM.load_hf_model
+
+        @staticmethod
+        def patched_load_hf_model(model_path, **kwargs):
+            # Disable tie_word_embeddings to avoid meta tensor copy error
+            kwargs['tie_word_embeddings'] = False
+            return Qwen3ForCausalLM.from_pretrained(model_path, **kwargs)
+
+        NeuronQwen3ForCausalLM.load_hf_model = patched_load_hf_model
+        logger.info("Successfully patched Qwen3 load_hf_model for tie_word_embeddings fix")
+    except ImportError:
+        logger.debug("Qwen3 model not available, skipping patch")
+    except Exception as e:
+        logger.warning(f"Failed to patch Qwen3 load_hf_model: {e}")
+
+
+# Apply the patch at module load time
+_patch_qwen3_load_hf_model()
+
+
 class NeuronModelBase(nn.Module):
     """
     Base class for all Neuron models.
@@ -226,7 +260,7 @@ class NeuronModelBase(nn.Module):
                 Path(model_name_or_path) / "neuron-compiled-artifacts" / hashed_config
             )
             path.mkdir(parents=True, exist_ok=True)
-            shutil.rmtree(path, ignore_errors=True)
+            # shutil.rmtree(path, ignore_errors=True)
             return path
         else:
             path = (
@@ -236,7 +270,7 @@ class NeuronModelBase(nn.Module):
                 / hashed_config
             )
             path.mkdir(parents=True, exist_ok=True)
-            shutil.rmtree(path, ignore_errors=True)
+            # shutil.rmtree(path, ignore_errors=True)
             return path
 
     def _load_compiled_model(self, compiled_model_path: str, neuronx_model_cls, kwargs):
@@ -963,6 +997,12 @@ def _get_neuron_model_cls(architecture: str):
 
             if model == "qwen3moe":
                 model = "qwen3_moe"
+
+            if model == "seedoss":
+                model = "seed_oss"
+
+            if model == "mimov2flash":
+                model = "mimo_v2_flash"
 
             if model == "qwen2vl":
                 model = "qwen2_vl"
