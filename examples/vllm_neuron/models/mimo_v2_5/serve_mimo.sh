@@ -26,6 +26,12 @@
 #                 'model*.safetensors' 'model.safetensors.index.json'
 #   MODEL=./MiMo-V2.5 bash serve_mimo.sh
 #
+# --max-num-batched-tokens must be passed explicitly: it does NOT follow
+# --max-model-len, it defaults to 2048, and validate_num_batched_tokens_buckets
+# requires the last num_batched_tokens_bucket to equal it. Without it any
+# SEQ > 2048 dies at startup with "Last bucket in num_batched_tokens_buckets
+# must equal max_num_batched_tokens (2048)".
+#
 # Usage:
 #   bash serve_mimo.sh                 # BS=32, SEQ=1024
 #   BS=1 SEQ=512 bash serve_mimo.sh
@@ -48,6 +54,7 @@ vllm serve "$MODEL" \
     --served-model-name MiMo-V2.5 \
     --max-model-len "$SEQ" \
     --max-num-seqs "$BS" \
+    --max-num-batched-tokens "$SEQ" \
     --tensor-parallel-size 64 \
     --enable-expert-parallel \
     --no-enable-prefix-caching \

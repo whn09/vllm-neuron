@@ -545,8 +545,21 @@ class MiMoV2Attention(nn.Module):
         ``k``/``v`` are head-major ``[nkh, T, dim]``. V is zero-padded from
         ``v_head_dim`` to ``kv_cache_head_dim`` because both caches share one
         ``head_size``; the padding is sliced off again after every gather.
+
+        Delegates to ``NF.write_paged_kv_cache``, whose NKI kernel scatters the
+        rows straight into the cache buffer. A plain ``index_put_`` here cost
+        ~171 ms of the 199 ms decode step: XLA has no in-place scatter, so each
+        of the 96 writes per step materialized a copy of the whole 322 MB pool,
+        and because vLLM shares one raw cache tensor across ~6 layers the FX
+        aliasing pass could only make the last write per buffer in-place.
+
+        The kernel's aliased outputs are deliberately discarded (as llama3 does
+        with ``NF.qkv_proj``'s): rebinding ``self.k_cache`` mid-forward would
+        mutate module state under ``torch.compile``, and it isn't needed --
+        ``AliasingOutputRewritePass`` finds the kernel's getitem outputs in the
+        FX graph and rewires every downstream reader of the shared placeholder
+        to the latest write itself.
         """
-        nkh = self.num_key_value_heads_per_rank
         pad = self.kv_cache_head_dim - self.v_head_dim
 
         k_flat = k.reshape(-1, self.head_dim).to(self.k_cache.dtype)
@@ -555,16 +568,15 @@ class MiMoV2Attention(nn.Module):
             v_flat = F.pad(v_flat, (0, pad))
         v_flat = v_flat.to(self.v_cache.dtype)
 
-        block_indices = slot_mapping // block_size
-        position_indices = slot_mapping % block_size
-        head_indices = torch.arange(
-            nkh, dtype=torch.long, device=k.device
-        ).repeat_interleave(slot_mapping.shape[0])
-        block_indices = block_indices.repeat(nkh)
-        position_indices = position_indices.repeat(nkh)
-
-        self.k_cache.index_put_((block_indices, head_indices, position_indices), k_flat)
-        self.v_cache.index_put_((block_indices, head_indices, position_indices), v_flat)
+        NF.write_paged_kv_cache(
+            k_cache=self.k_cache,
+            v_cache=self.v_cache,
+            k=k_flat,
+            v=v_flat,
+            slot_mapping=slot_mapping,
+            block_size=block_size,
+            num_kv_heads=self.num_key_value_heads_per_rank,
+        )
 
     def _gather_paged_kv(
         self, block_table: torch.Tensor, block_size: int
