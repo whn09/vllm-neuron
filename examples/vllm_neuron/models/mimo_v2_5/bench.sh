@@ -27,14 +27,15 @@ MODEL="${MODEL:-MiMo-V2.5}"
 # --model is the *served alias* that goes into the request payload, and the
 # driver also feeds it to AutoTokenizer to synthesize the random dataset -- where
 # an alias is not resolvable ("MiMo-V2.5 is not a local folder and is not a valid
-# model identifier"). So point --tokenizer at the checkpoint on disk explicitly.
-TOKENIZER="${TOKENIZER:-/opt/dlami/nvme/models/MiMo-V2.5-text}"
+# model identifier"). So name the tokenizer source explicitly: a hub repo ID (the
+# default, cached in HF_HOME) or the local checkpoint the server is reading.
+TOKENIZER="${TOKENIZER:-XiaomiMiMo/MiMo-V2.5}"
 INPUT_LEN="${INPUT_LEN:-900}"
 OUTPUT_LEN="${OUTPUT_LEN:-90}"
 RANGE_RATIO="${RANGE_RATIO:-0.03}"
 CONCURRENCIES="${CONCURRENCIES:-1 16 32}"
 TAG="${TAG:-bs32}"
-RESULTS_DIR="${RESULTS_DIR:-/opt/dlami/nvme/mimo_logs/bench}"
+RESULTS_DIR="${RESULTS_DIR:-./mimo_bench_results}"
 VENV="${VENV:-/opt/aws_neuronx_venv_pytorch_inference_vllm_0_21_0_1_0_0}"
 
 mkdir -p "$RESULTS_DIR"

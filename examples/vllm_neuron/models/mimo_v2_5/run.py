@@ -16,8 +16,14 @@ NeuronCores) with ``enable_expert_parallel`` and ``ep_degree=64``, giving
 tp_sub = 64/64 = 1 (pure EP) and 4 experts per rank. 64 Q heads divide evenly
 by 64; the 4-and-8 KV head counts are replicated across ranks.
 
-      python examples/vllm_neuron/models/mimo_v2_5/run.py \
-      --model-checkpoint /opt/dlami/nvme/models/MiMo-V2.5-HF
+      python examples/vllm_neuron/models/mimo_v2_5/run.py
+
+Defaults to the public ``XiaomiMiMo/MiMo-V2.5`` repo (~294 GiB, downloaded to
+HF_HOME on first use). Pass ``--model-checkpoint`` a local path to reuse an
+existing copy. The vision/audio towers are not built by this port, so
+``assets/``, ``audio_tokenizer/`` and ``preprocessor_config.json`` are dead
+weight in a text-only download -- see serve_mimo.sh for an allow-listed
+``hf download`` that skips them.
 
 Attention runs eager (fp32 scores), not through a fused kernel: MiMo's 192-wide
 Q/K heads exceed the 128 head_dim cap in flash_attention / attention_decode /
@@ -63,8 +69,10 @@ def main():
     parser.add_argument(
         "--model-checkpoint",
         type=str,
-        default="/opt/dlami/nvme/models/MiMo-V2.5-HF",
-        help="Path to the HF checkpoint (FP8 on disk; dequantized at load time).",
+        default="XiaomiMiMo/MiMo-V2.5",
+        help="Hub repo ID or local path to the HF checkpoint (FP8 on disk; "
+        "dequantized at load time). Passed through to vLLM unchanged, so a "
+        "hub ID downloads to HF_HOME on first use.",
     )
     parser.add_argument("--tensor-parallel-size", type=int, default=64)
     parser.add_argument("--ep-degree", type=int, default=64)

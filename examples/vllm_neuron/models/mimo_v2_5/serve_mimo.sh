@@ -14,13 +14,25 @@
 # SEQ forces a fresh compile (~5-10 min). Keep them as env knobs rather than
 # editing inline, and let bench.sh drive load against an already-warm server.
 #
+# MODEL takes a hub repo ID or a local path -- vllm resolves either. The default
+# pulls the public checkpoint (~294 GiB) into HF_HOME on first start, which makes
+# the first launch look like it is hanging before compilation even begins. To
+# fetch only what a text-only server reads (skipping the vision/audio assets this
+# port never builds) and serve from disk instead:
+#
+#   hf download XiaomiMiMo/MiMo-V2.5 --local-dir ./MiMo-V2.5 \
+#       --include 'config.json' 'configuration_mimo_v2.py' 'modeling_mimo_v2.py' \
+#                 'generation_config.json' 'tokenizer*' 'vocab.json' 'merges.txt' \
+#                 'model*.safetensors' 'model.safetensors.index.json'
+#   MODEL=./MiMo-V2.5 bash serve_mimo.sh
+#
 # Usage:
 #   bash serve_mimo.sh                 # BS=32, SEQ=1024
 #   BS=1 SEQ=512 bash serve_mimo.sh
 
 set -x
 
-MODEL="${MODEL:-/opt/dlami/nvme/models/MiMo-V2.5-text}"
+MODEL="${MODEL:-XiaomiMiMo/MiMo-V2.5}"
 BS="${BS:-32}"
 SEQ="${SEQ:-1024}"
 PORT="${PORT:-8000}"
