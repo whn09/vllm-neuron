@@ -1309,6 +1309,24 @@ class MiMoV2SparseMoeBlock(nn.Module):
 
         if can_run_kernel(hidden_states):
             rank_id = self._ep_rank_tensor(rank, hidden_states.device).reshape(1, 1)
+            # Static all-expert dispatch, deliberately. The two alternatives were
+            # both measured on device and both lose:
+            #
+            #   - ``is_all_expert=False`` (routed/selective) indexes the LOCAL
+            #     [E_L, H, 2, I] weights with the GLOBAL expert id and takes no
+            #     rank_id, so it is EP-incompatible by construction (which is why
+            #     gpt_oss/model_bf16.py force-enables all-expert when ep_degree>1).
+            #     It also does K=8 experts of work per token against all-expert's
+            #     E_local=4, and does not compile at these dims.
+            #   - ``is_all_expert_dynamic=True`` skips token blocks with no routed
+            #     tokens, and in an isolated single-kernel microbenchmark that
+            #     looked like a 1.2-1.55x win at T>=16 (bit-exact). END TO END IT
+            #     IS SLOWER: median ITL 160.6/152.9/148.1 ms at concurrency
+            #     1/16/32 versus 147.2/147.2/147.1 static, same host, same
+            #     recompile. The microbenchmark measured one kernel per host round
+            #     trip; in the real graph these are 47 back-to-back invocations
+            #     and the data-dependent control flow (nl.dynamic_range +
+            #     _find_routed_tokens) costs more than the skipping saves.
             output = NF.moe_tkg(
                 hidden_input=hidden_states,
                 expert_gate_up_weights=self._gate_up_kernel_view(),
