@@ -57,6 +57,24 @@ FILLER = (
 )
 
 
+def mac_threshold_override(model: str) -> dict:
+    """``{"hlo2tensorizer_options": ""}`` for a dense checkpoint, ``{}`` for MoE.
+
+    That override suppresses the runner's ``--modular-flow-mac-threshold=10``.
+    The dense graphs need it suppressed -- with the flag, neuronx-cc fails
+    codegen on their decode graph (NCC_IBTN006 on a pftranspose copy) -- and the
+    sparse ones need it kept, because the flag exists for exactly the NKI kernels
+    the MoE block calls. Keyed off the checkpoint rather than a command-line flag
+    because the reason is structural and a flag would be forgotten.
+    """
+    from transformers import AutoConfig
+
+    text_config = AutoConfig.from_pretrained(model).text_config
+    if getattr(text_config, "num_experts", None):
+        return {}
+    return {"hlo2tensorizer_options": ""}
+
+
 def prefill_buckets(spec: str) -> list[int]:
     """Parse ``--prefill-buckets`` into a strictly ascending list of token counts."""
     buckets = [int(x) for x in spec.split(",")]
@@ -95,6 +113,20 @@ def parse_args() -> argparse.Namespace:
     # (NCC_IINAR001) and compiles at -O2/-O3; the platform lowers vLLM's
     # default O2 to O1 and cannot see an explicit offline O2, so pass 3.
     parser.add_argument("--gpu-memory-utilization", type=float, default=None)
+    parser.add_argument(
+        "--expert-parallel",
+        action="store_true",
+        help="shard the experts across ranks instead of each expert's "
+        "intermediate dimension. Optional for 35B-A3B and required for "
+        "397B-A17B; see run.py for why the degree matters.",
+    )
+    parser.add_argument(
+        "--ep-degree",
+        type=int,
+        default=None,
+        help="expert-parallel degree; requires --expert-parallel. Defaults to "
+        "the world size.",
+    )
     parser.add_argument("--optlevel", type=int, default=None, choices=[0, 1, 2, 3])
     parser.add_argument("--sync-scheduling", action="store_true")
     # Concurrency, which no longer has to equal the compiled batch bucket.
@@ -124,6 +156,20 @@ def parse_args() -> argparse.Namespace:
         "encoder — use it only to quantify that difference",
     )
     return parser.parse_args()
+
+
+def ep_neuron_config(args) -> dict:
+    """``ep_degree`` for the neuron_config, validated.
+
+    vLLM's ``enable_expert_parallel`` is a bool and its degree is the world size,
+    so the plugin carries an explicit degree on NeuronConfig instead. Unset, it
+    resolves to the world size -- pure EP, ``tp_degree = 1``.
+    """
+    if args.ep_degree is None:
+        return {}
+    if not args.expert_parallel:
+        raise SystemExit("--ep-degree requires --expert-parallel")
+    return {"ep_degree": args.ep_degree}
 
 
 def build_prompt(model_path: str, num_tokens: int, salt: int) -> str:
@@ -222,6 +268,8 @@ async def main_async(args) -> None:
             sys.argv.append(f"--optimization-level={args.optlevel}")
     if args.sync_scheduling:
         extra["async_scheduling"] = False
+    if args.expert_parallel:
+        extra["enable_expert_parallel"] = True
 
     engine_args = AsyncEngineArgs(
         model=args.model,
@@ -244,9 +292,8 @@ async def main_async(args) -> None:
                 ),
                 "num_seqs_buckets": [args.max_num_seqs],
                 "on_device_sampling_config": {"all_greedy": True},
-                # See run.py: the runner's default --modular-flow-mac-threshold
-                # breaks codegen on this model's decode graph.
-                "hlo2tensorizer_options": "",
+                **mac_threshold_override(args.model),
+                **ep_neuron_config(args),
             },
             # Supplying this at all is what selects the VL implementation, so a
             # zero bucket means "text-only" rather than "vision with no budget".

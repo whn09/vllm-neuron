@@ -57,6 +57,24 @@ VL_IMAGE_ASSET = "cherry_blossom"
 VL_IMAGE_SIZE = 224
 
 
+def mac_threshold_override(model: str) -> dict:
+    """``{"hlo2tensorizer_options": ""}`` for a dense checkpoint, ``{}`` for MoE.
+
+    That override suppresses the runner's ``--modular-flow-mac-threshold=10``.
+    The dense graphs need it suppressed -- with the flag, neuronx-cc fails
+    codegen on their decode graph (NCC_IBTN006 on a pftranspose copy) -- and the
+    sparse ones need it kept, because the flag exists for exactly the NKI kernels
+    the MoE block calls. Keyed off the checkpoint rather than a command-line flag
+    because the reason is structural and a flag would be forgotten.
+    """
+    from transformers import AutoConfig
+
+    text_config = AutoConfig.from_pretrained(model).text_config
+    if getattr(text_config, "num_experts", None):
+        return {}
+    return {"hlo2tensorizer_options": ""}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Qwen/Qwen3.5-2B")
@@ -79,14 +97,45 @@ def parse_args() -> argparse.Namespace:
     # checkpoint does not fit in host RAM in float32; that weakens the comparison
     # symmetrically -- both sides then round the same way -- and the check this
     # script exists for, "is the first token right", survives it.
+    parser.add_argument(
+        "--expert-parallel",
+        action="store_true",
+        help="shard the experts across ranks instead of each expert's "
+        "intermediate dimension. Optional for 35B-A3B and required for "
+        "397B-A17B; see run.py for why the degree matters.",
+    )
+    parser.add_argument(
+        "--ep-degree",
+        type=int,
+        default=None,
+        help="expert-parallel degree; requires --expert-parallel. Defaults to "
+        "the world size.",
+    )
     parser.add_argument("--hf-dtype", default="fp32", choices=("fp32", "bf16"))
     return parser.parse_args()
 
 
 def engine_extras(args) -> dict:
-    if args.gpu_memory_utilization is None:
+    extras = {}
+    if args.gpu_memory_utilization is not None:
+        extras["gpu_memory_utilization"] = args.gpu_memory_utilization
+    if args.expert_parallel:
+        extras["enable_expert_parallel"] = True
+    return extras
+
+
+def ep_neuron_config(args) -> dict:
+    """``ep_degree`` for the neuron_config, validated.
+
+    vLLM's ``enable_expert_parallel`` is a bool and its degree is the world size,
+    so the plugin carries an explicit degree on NeuronConfig instead. Unset, it
+    resolves to the world size -- pure EP, ``tp_degree = 1``.
+    """
+    if args.ep_degree is None:
         return {}
-    return {"gpu_memory_utilization": args.gpu_memory_utilization}
+    if not args.expert_parallel:
+        raise SystemExit("--ep-degree requires --expert-parallel")
+    return {"ep_degree": args.ep_degree}
 
 
 def build_vl_prompt(model_path: str):
@@ -134,9 +183,7 @@ def run_neuron_vl(args) -> None:
                 "num_batched_tokens_buckets": [args.max_model_len],
                 "num_seqs_buckets": [1],
                 "on_device_sampling_config": {"all_greedy": True},
-                # See run.py: the runner's default
-                # --modular-flow-mac-threshold breaks codegen here.
-                "hlo2tensorizer_options": "",
+                **mac_threshold_override(args.model),
             },
             "vision_neuron_config": {
                 "num_vision_tokens_buckets": [args.vision_bucket],
@@ -230,9 +277,8 @@ def run_neuron(args) -> None:
                 "num_batched_tokens_buckets": [args.max_model_len],
                 "num_seqs_buckets": [len(PROMPTS)],
                 "on_device_sampling_config": {"all_greedy": True},
-                # See run.py: the runner's default
-                # --modular-flow-mac-threshold breaks codegen here.
-                "hlo2tensorizer_options": "",
+                **mac_threshold_override(args.model),
+                **ep_neuron_config(args),
             },
         },
     )

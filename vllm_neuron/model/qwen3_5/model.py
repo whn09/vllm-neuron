@@ -25,7 +25,8 @@ is a silent-wrong-output hazard rather than a crash:
 so the 6 attention layers run in torch rather than on the kernel. That was
 *expected* to be the performance ceiling; measured, it is not — torch attention is
 6-8% of prefill, because at TP=4 there are only 2 query heads per rank so the
-``[2, seq, seq]`` score matrix is cheap.
+``[2, seq, seq]`` score matrix is cheap. See HANDOFF, "Where prefill time actually
+goes".
 """
 
 from __future__ import annotations
@@ -50,6 +51,7 @@ from vllm_neuron.utils.weight_loader import (
 from .config import Qwen3_5Config, Qwen3_5TextConfig
 from .deltanet import Qwen3_5GatedDeltaNet
 from .flags import ABLATE_MIXERS, SEQUENCE_PARALLEL
+from .moe import Qwen3_5SparseMoeBlock
 
 HF_TEXT_PREFIX = "model.language_model"
 
@@ -584,7 +586,13 @@ class Qwen3_5DecoderLayer(nn.Module):
         else:
             self.self_attn = Qwen3_5Attention(config, layer_idx)
             self.mixer_name = self.self_attn.layer_name
-        self.mlp = Qwen3_5MLP(config)
+        # The MoE block takes the *unnormalised* residual and is handed this
+        # layer's ``post_attention_layernorm`` instead, because its decode kernel
+        # fuses the norm. See ``moe.py``.
+        self.is_moe = config.is_moe
+        self.mlp = (
+            Qwen3_5SparseMoeBlock(config) if self.is_moe else Qwen3_5MLP(config)
+        )
 
     def forward(
         self,
@@ -592,6 +600,7 @@ class Qwen3_5DecoderLayer(nn.Module):
         positions: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attn_metadata: dict,
+        rank: torch.Tensor | None = None,
     ) -> torch.Tensor:
         metadata = attn_metadata[self.mixer_name]
         is_decode = metadata["max_query_len"] <= metadata["decode_token_threshold"]
@@ -614,8 +623,17 @@ class Qwen3_5DecoderLayer(nn.Module):
             hidden_states = residual + hidden_states
 
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states, is_prefill=not is_decode)
+        if self.is_moe:
+            hidden_states = self.mlp(
+                hidden_states,
+                is_prefill=not is_decode,
+                norm=self.post_attention_layernorm,
+                positions=positions,
+                rank=rank,
+            )
+        else:
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states, is_prefill=not is_decode)
         return residual + hidden_states
 
 
@@ -707,7 +725,7 @@ class Qwen3_5TextModel(nn.Module):
 
         for layer in self.layers:
             hidden_states = layer(
-                hidden_states, positions, position_embeddings, attn_metadata
+                hidden_states, positions, position_embeddings, attn_metadata, rank=rank
             )
 
         hidden_states = self.norm(hidden_states)
@@ -946,9 +964,33 @@ class Qwen3_5ForCausalLM(nn.Module, SupportsMRoPE):
             mappings[f"{ours}.post_attention_layernorm.weight"] = (
                 f"{hf}.post_attention_layernorm.weight"
             )
-            mappings[f"{ours}.mlp.gate_proj_weight"] = f"{hf}.mlp.gate_proj.weight"
-            mappings[f"{ours}.mlp.up_proj_weight"] = f"{hf}.mlp.up_proj.weight"
-            mappings[f"{ours}.mlp.down_proj_weight"] = f"{hf}.mlp.down_proj.weight"
+            if layer.is_moe:
+                # Note the missing ``.weight``: the two stacked expert tensors
+                # are plain ``nn.Parameter``s on ``Qwen3_5MoeExperts``, not
+                # ``nn.Linear`` weights, so the checkpoint key has no suffix.
+                mappings[f"{ours}.mlp.experts_gate_up_weight"] = (
+                    f"{hf}.mlp.experts.gate_up_proj"
+                )
+                mappings[f"{ours}.mlp.experts_down_weight"] = (
+                    f"{hf}.mlp.experts.down_proj"
+                )
+                mappings[f"{ours}.mlp.router_weight"] = f"{hf}.mlp.gate.weight"
+                mappings[f"{ours}.mlp.shared_gate_proj_weight"] = (
+                    f"{hf}.mlp.shared_expert.gate_proj.weight"
+                )
+                mappings[f"{ours}.mlp.shared_up_proj_weight"] = (
+                    f"{hf}.mlp.shared_expert.up_proj.weight"
+                )
+                mappings[f"{ours}.mlp.shared_down_proj_weight"] = (
+                    f"{hf}.mlp.shared_expert.down_proj.weight"
+                )
+                mappings[f"{ours}.mlp.shared_expert_gate_weight"] = (
+                    f"{hf}.mlp.shared_expert_gate.weight"
+                )
+            else:
+                mappings[f"{ours}.mlp.gate_proj_weight"] = f"{hf}.mlp.gate_proj.weight"
+                mappings[f"{ours}.mlp.up_proj_weight"] = f"{hf}.mlp.up_proj.weight"
+                mappings[f"{ours}.mlp.down_proj_weight"] = f"{hf}.mlp.down_proj.weight"
 
             if layer.is_linear_attention:
                 mixer_hf = f"{hf}.linear_attn"

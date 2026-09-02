@@ -16,6 +16,13 @@ Usage (2B, on a trn2.3xlarge: 4 logical NeuronCores, so TP=4 is the ceiling):
         --model <path-to-checkpoint>/Qwen3.5-27B \
         --gpu-memory-utilization 0.65 --optlevel 3
 
+    # 35B-A3B (sparse). Needs the memory cap but *not* the higher optlevel, and
+    # must keep the mac threshold the dense models suppress -- see
+    # mac_threshold_override below.
+    python examples/vllm_neuron/models/qwen3_5/run.py \
+        --model <path-to-checkpoint>/Qwen3.5-35B-A3B \
+        --gpu-memory-utilization 0.72
+
 This demo is text-only. The vision-language path (``model/qwen3_5/vl.py``,
 which reuses the Qwen3-VL encoder) is selected by passing a
 ``vision_neuron_config``; see ``check_generation_vs_hf.py --vl``.
@@ -37,6 +44,38 @@ PROMPTS = [
 ]
 
 
+def mac_threshold_override(model: str) -> dict:
+    """``{"hlo2tensorizer_options": ""}`` for a dense checkpoint, ``{}`` for MoE.
+
+    That override suppresses the runner's ``--modular-flow-mac-threshold=10``.
+    The dense graphs need it suppressed -- with the flag, neuronx-cc fails
+    codegen on their decode graph (NCC_IBTN006 on a pftranspose copy) -- and the
+    sparse ones need it kept, because the flag exists for exactly the NKI kernels
+    the MoE block calls. Keyed off the checkpoint rather than a command-line flag
+    because the reason is structural and a flag would be forgotten.
+    """
+    from transformers import AutoConfig
+
+    text_config = AutoConfig.from_pretrained(model).text_config
+    if getattr(text_config, "num_experts", None):
+        return {}
+    return {"hlo2tensorizer_options": ""}
+
+
+def ep_neuron_config(args) -> dict:
+    """``ep_degree`` for the neuron_config, validated.
+
+    vLLM's ``enable_expert_parallel`` is a bool and its degree is the world size,
+    so the plugin carries an explicit degree on NeuronConfig instead. Unset, it
+    resolves to the world size -- pure EP, ``tp_degree = 1``.
+    """
+    if args.ep_degree is None:
+        return {}
+    if not args.expert_parallel:
+        raise SystemExit("--ep-degree requires --expert-parallel")
+    return {"ep_degree": args.ep_degree}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Qwen/Qwen3.5-2B")
@@ -56,6 +95,26 @@ def main() -> None:
     # and cannot see an explicit offline O2, so pass 3 -- its own docstring
     # points at O3 as the way to force a higher level.
     parser.add_argument("--optlevel", type=int, default=None, choices=[0, 1, 2, 3])
+    parser.add_argument(
+        "--expert-parallel",
+        action="store_true",
+        help="give each rank a disjoint subset of the experts, instead of a "
+        "column of every expert. 35B-A3B does not want this: per-rank prefill "
+        "work and the number of graphs to compile both grow with the degree "
+        "while the footprint does not. It is here because it is the only layout "
+        "that can serve 397B-A17B, whose moe_intermediate_size of 1024 caps pure "
+        "tensor parallelism at 8 ranks -- the fused decode kernel needs a "
+        "multiple of 128 per rank -- far short of the ranks its weights need.",
+    )
+    parser.add_argument(
+        "--ep-degree",
+        type=int,
+        default=None,
+        help="expert-parallel degree; requires --expert-parallel. Left unset it "
+        "resolves to the world size, i.e. tp_degree=1, which is the most "
+        "expensive legal choice: prefer the smallest degree that keeps "
+        "moe_intermediate_size/tp_degree a multiple of 128.",
+    )
     args = parser.parse_args()
 
     extra = {}
@@ -65,6 +124,8 @@ def main() -> None:
         from vllm.config.vllm import OptimizationLevel
 
         extra["optimization_level"] = OptimizationLevel(args.optlevel)
+    if args.expert_parallel:
+        extra["enable_expert_parallel"] = True
 
     llm = LLM(
         model=args.model,
@@ -88,13 +149,8 @@ def main() -> None:
                 "num_batched_tokens_buckets": [args.prefill_bucket],
                 "num_seqs_buckets": [args.max_num_seqs],
                 "on_device_sampling_config": {"all_greedy": True},
-                # No extra hlo2tensorizer options. The runner's default
-                # --modular-flow-mac-threshold=10 exists only for NKI kernels,
-                # which this model has none of, and it makes neuronx-cc fail
-                # codegen on the decode graph (NCC_IBTN006: a pftranspose whose
-                # copy fails backend verification). Verified by recompiling the
-                # cached HLO by hand: fails with the flag, succeeds without it.
-                "hlo2tensorizer_options": "",
+                **mac_threshold_override(args.model),
+                **ep_neuron_config(args),
             },
         },
     )

@@ -142,3 +142,15 @@ class Qwen3_5ForConditionalGeneration(
     ) -> int:
         """A ``max_pixels`` cap expressed as a raw (pre-merge) token count."""
         return max_pixels // (hf_config.vision_config.patch_size**2)
+
+
+class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
+    """The sparse checkpoints (``model_type: qwen3_5_moe``, e.g. 35B-A3B).
+
+    A separate registry entry only because the checkpoint declares a different
+    architecture name. The decoder is the same hybrid stack with the same state
+    geometry, and the dense MLP is swapped for ``Qwen3_5SparseMoeBlock`` inside
+    ``Qwen3_5DecoderLayer`` off ``config.is_moe`` -- so everything inherited
+    here, including the recurrent-state and vision classmethods vLLM resolves
+    through the registry, is correct unchanged.
+    """

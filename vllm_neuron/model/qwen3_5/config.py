@@ -27,6 +27,78 @@ LINEAR_ATTENTION = "linear_attention"
 FULL_ATTENTION = "full_attention"
 
 
+@dataclass
+class Qwen3_5MoeParams:
+    """The sparse-MLP half of ``qwen3_5_moe`` (35B-A3B and up).
+
+    Present only for ``model_type: qwen3_5_moe``. Everything else about the
+    decoder — hybrid DeltaNet/GQA, zero-centred norms, gated attention output,
+    partial interleaved mRoPE — is identical to the dense checkpoints, so the MoE
+    variant is a *different MLP*, not a different model.
+
+    ``num_experts`` routed experts of width ``moe_intermediate_size`` each, top
+    ``num_experts_per_tok`` per token with the affinities L1-renormalised, plus a
+    single always-on shared expert of width ``shared_expert_intermediate_size``
+    whose contribution is scaled by ``sigmoid(shared_expert_gate(x))``. That
+    sigmoid gate is why the shared expert cannot ride along inside the fused MoE
+    kernel — see ``moe.py``.
+    """
+
+    num_experts: int
+    num_experts_per_tok: int
+    moe_intermediate_size: int
+    shared_expert_intermediate_size: int
+    # HF renormalises the top-k probabilities (``router_top_value /= sum``) and
+    # this checkpoint does not carry the flag, so True is the checkpoint's
+    # behaviour rather than a default we chose.
+    norm_topk_prob: bool = True
+
+    @classmethod
+    def from_hf(cls, text_cfg: PretrainedConfig) -> Qwen3_5MoeParams | None:
+        """``None`` for a dense checkpoint; the params for a MoE one."""
+        num_experts = getattr(text_cfg, "num_experts", None)
+        if not num_experts:
+            return None
+
+        # <-- MODEL-SPECIFIC: Qwen3-Next lets individual layers fall back to a
+        # dense MLP. This checkpoint ships ``mlp_only_layers: []`` and every
+        # layer is sparse; a mixed stack would need the dense MLP wired in
+        # alongside, which is not implemented.
+        mlp_only = tuple(getattr(text_cfg, "mlp_only_layers", ()) or ())
+        if mlp_only:
+            raise NotImplementedError(
+                f"mlp_only_layers={list(mlp_only)} is not implemented for the "
+                f"MoE variant; every layer must be sparse."
+            )
+        step = getattr(text_cfg, "decoder_sparse_step", 1)
+        if step != 1:
+            raise NotImplementedError(
+                f"decoder_sparse_step={step} is not implemented; every layer "
+                f"must be sparse."
+            )
+        scoring = getattr(text_cfg, "scoring_func", "softmax")
+        if scoring != "softmax":
+            raise NotImplementedError(
+                f"router scoring_func={scoring!r} is not implemented; only "
+                f"'softmax' has been validated."
+            )
+
+        shared = getattr(text_cfg, "shared_expert_intermediate_size", None)
+        if not shared:
+            raise NotImplementedError(
+                "Qwen3.5-MoE without a shared expert is not implemented; the "
+                "checkpoint is expected to carry shared_expert_intermediate_size."
+            )
+
+        return cls(
+            num_experts=int(num_experts),
+            num_experts_per_tok=int(text_cfg.num_experts_per_tok),
+            moe_intermediate_size=int(text_cfg.moe_intermediate_size),
+            shared_expert_intermediate_size=int(shared),
+            norm_topk_prob=bool(getattr(text_cfg, "norm_topk_prob", True)),
+        )
+
+
 def _dtype_of(cfg: PretrainedConfig, default: torch.dtype) -> torch.dtype:
     raw = getattr(cfg, "dtype", None) or getattr(cfg, "torch_dtype", None)
     if raw is None:
@@ -54,7 +126,9 @@ class Qwen3_5TextConfig:
     """
 
     hidden_size: int
-    intermediate_size: int
+    # ``None`` on a MoE checkpoint: it has no dense MLP and ships no
+    # ``intermediate_size``. Read ``moe`` instead.
+    intermediate_size: int | None
     num_hidden_layers: int
     layer_types: tuple[str, ...]
 
@@ -82,9 +156,16 @@ class Qwen3_5TextConfig:
     max_position_embeddings: int
     torch_dtype: torch.dtype
 
+    # ``None`` for a dense checkpoint (2B, 27B); set for ``qwen3_5_moe``.
+    moe: Qwen3_5MoeParams | None = None
+
     # Attached by ``Qwen3_5Config.from_configs``; the model reads on-device
     # sampling and logprob settings off it.
     neuron_config: object | None = None
+
+    @property
+    def is_moe(self) -> bool:
+        return self.moe is not None
 
     @property
     def rotary_dim(self) -> int:
@@ -191,13 +272,23 @@ class Qwen3_5TextConfig:
                 f"num_hidden_layers is {text_cfg.num_hidden_layers}"
             )
 
-        # <-- MODEL-SPECIFIC: mlp_only_layers is a Qwen3-Next/MoE knob. This
-        # checkpoint leaves it empty and the dense MLP is used on every layer.
+        # <-- MODEL-SPECIFIC: mlp_only_layers is a Qwen3-Next/MoE knob. Both the
+        # dense and the MoE checkpoints leave it empty, so every layer has a
+        # mixer and an MLP of one kind. ``Qwen3_5MoeParams.from_hf`` re-checks it
+        # for the sparse case, where a non-empty list would mean a *mixed* stack.
         mlp_only = tuple(getattr(text_cfg, "mlp_only_layers", ()) or ())
         if mlp_only:
             raise NotImplementedError(
                 f"mlp_only_layers={list(mlp_only)} is not implemented; this "
                 f"port assumes every layer has both a mixer and an MLP."
+            )
+
+        moe = Qwen3_5MoeParams.from_hf(text_cfg)
+        intermediate_size = getattr(text_cfg, "intermediate_size", None)
+        if moe is None and not intermediate_size:
+            raise ValueError(
+                "a dense Qwen3.5 checkpoint must carry intermediate_size, and a "
+                "sparse one must carry num_experts; this config has neither."
             )
 
         if not getattr(text_cfg, "attn_output_gate", False):
@@ -215,7 +306,7 @@ class Qwen3_5TextConfig:
 
         return cls(
             hidden_size=text_cfg.hidden_size,
-            intermediate_size=text_cfg.intermediate_size,
+            intermediate_size=intermediate_size,
             num_hidden_layers=text_cfg.num_hidden_layers,
             layer_types=layer_types,
             num_attention_heads=text_cfg.num_attention_heads,
@@ -239,6 +330,7 @@ class Qwen3_5TextConfig:
             ),
             max_position_embeddings=text_cfg.max_position_embeddings,
             torch_dtype=_dtype_of(text_cfg, torch.bfloat16),
+            moe=moe,
         )
 
 
