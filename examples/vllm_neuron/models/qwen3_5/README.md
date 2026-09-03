@@ -108,40 +108,58 @@ near-tie and greedy decoding amplifies it.
 
 ## Sizing the prefill bucket
 
-`--prefill-chunk` sets `max_num_batched_tokens`. Left unset it follows
-`--max-model-len`, which compiles a single prefill graph that covers any prompt
-the model can accept. That is convenient, and on 27B it costs a factor of 2.8 in
-TTFT.
+`num_batched_tokens_buckets` is the list of prefill token counts the plugin
+compiles, and every prompt pads up to the nearest one. Left alone the plugin
+defaults to powers of two from 128 up to `max_num_batched_tokens`, so a short
+prompt lands on a small bucket. `--prefill-buckets` overrides that list and takes
+`max_num_batched_tokens` from its largest entry.
 
-With `max_model_len` 2048 and a 1024-token prompt, the graph is sized for twice
-the work the request does and the tiles stop fitting the 24 MB SBUF. A device
-profile of that graph attributes **78% of all HBM reads to SBUF spill reloads**
--- 108.7 GB of reloads against 13.5 GB/rank of weights, with spill making up 81%
-of total HBM traffic. Sizing the bucket to the prompt removes nearly all of it:
+Pinning a *single* bucket is the case to watch, not least because it is also how
+you would spell NxDI's old `enable_bucketing=False`. With one 2048 bucket a
+1024-token prompt is padded to 2048 -- twice the work the request needs -- and on
+27B the tiles stop fitting the 24 MB SBUF. A device profile of that graph
+attributes **78% of all HBM reads to SBUF spill reloads**: 108.7 GB of reloads
+against 13.5 GB/rank of weights, with spill making up 81% of total HBM traffic.
+Padding alone would predict 2.0x; the spill cliff on top of it makes the measured
+cost 2.8x.
 
-| `--prefill-chunk` | TTFT (27B, batch 1, 1024-token prompt) |
-|---|---|
-| 2048 (= `max_model_len`, the default) | 789 ms |
-| **1024** | **284 ms** |
-| 512 | 287 ms |
+27B at batch 1 on a 1024-token prompt, TP=4:
 
-TPOT is unchanged at 48.5 ms and the decode NEFF is byte-identical, so this
-touches prefill only. Compile time falls with the bucket as well -- roughly half
-at 1024 and roughly a quarter at 512 in the same sweep -- because the prefill
-graph dominates the 27B compile.
+| prefill buckets | TTFT | first compile |
+|---|---|---|
+| `2048` pinned (= `max_model_len`) | 789 ms | 84 min |
+| `1024` | **284 ms** | 37 min |
+| `512` | 287 ms | 21 min |
 
-Two things worth knowing before picking a value:
+TPOT is unchanged at 48.5 ms and the decode NEFF is byte-identical, so this is
+prefill-only. Compile time falls along with the bucket because every bucket is a
+separate prefill graph and the prefill graph dominates the 27B compile.
 
-- 1024 on a 1024-token prompt is a *single* chunk, so the win above is not
-  chunked prefill. It is the bucket matching the request, and the lesson is to
-  size the bucket to the prompts actually served rather than to `max_model_len`.
-- Chunking is cheap when it does happen: 2x512 costs 2.6% more graph time than
-  1x1024 (255.9 vs 249.5 ms), so a 512-1024 bucket stays reasonable for prompts
-  longer than one chunk. 512 is the floor -- Neuron accepts
-  `[512, 1024, 2048, 4096, 8192]` and rejects anything else.
+The win holds at batch 4: median TTFT goes from 2101 ms to 829 ms. Prefills
+serialise at batch > 1 (see the note below), so TTFT spreads out -- 281 ms for the
+first request in the batch, 1236 ms for the last -- but the per-prefill cost is the
+same as at batch 1.
 
-Neuron supports chunking prefills at batch size 1 only; it logs this and will
-not mix prefill and decode in one batch. Every number above is batch 1.
+Guidance:
+
+- Leave `--prefill-buckets` unset unless you have a reason to set it. The default
+  list already covers short prompts.
+- Pin a narrow list when compile time matters, using the table above as the guide.
+- Which values are legal turns on whether the largest bucket equals
+  `max_model_len`. If it does, prefill is single-shot and any strictly ascending
+  list is accepted, 128 and 256 included. If it is smaller, Neuron auto-enables
+  its segmented-attention kernel, the list must match `kv_segment_size_buckets`,
+  and values are restricted to `[512, 1024, 2048, 4096, 8192]` -- 512 is the floor
+  in that case only.
+- `1024` in the table is the second case, and for a 1024-token prompt it is a
+  single chunk, so none of the numbers above measure multi-chunk prefill. When
+  chunking does happen it is cheap: 2x512 costs 2.6% more graph time than 1x1024
+  (255.9 vs 249.5 ms).
+
+vLLM enables chunked prefill by default, and the Neuron platform logs that it
+"only supports chunking prefills with batch size of 1" and will not mix prefill
+and decode in the same batch. That warning appears for every configuration here,
+pinned or default, so it is not a consequence of this setting.
 
 ## Known limitations
 

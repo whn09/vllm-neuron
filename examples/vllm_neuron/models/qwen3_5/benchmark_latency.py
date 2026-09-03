@@ -13,11 +13,12 @@ want to measure -- measure batch 1 and batch 4 in separate processes rather than
 configuring several buckets (supplying several ``num_seqs_buckets`` hangs, see
 README.md "Known limitations").
 
-``--prefill-chunk`` sizes the prefill token bucket independently of
-``--max-model-len``. Left unset it follows ``--max-model-len``, which compiles one
-prefill graph covering any acceptable prompt -- convenient, but it oversizes the
-tile for shorter prompts and on 27B that costs a factor of 2.8 in TTFT. See
-README.md "Sizing the prefill bucket".
+``--prefill-buckets`` sets the prefill token buckets, and
+``max_num_batched_tokens`` follows the largest of them. Left unset, the plugin's
+own default applies -- powers of two from 128 up to ``--max-model-len`` -- so short
+prompts land on a small bucket. Pinning a *single* bucket instead pads every
+prefill up to it, which on 27B costs a factor of 2.8 in TTFT. See README.md
+"Sizing the prefill bucket".
 
 Usage:
 
@@ -56,6 +57,16 @@ FILLER = (
 )
 
 
+def prefill_buckets(spec: str) -> list[int]:
+    """Parse ``--prefill-buckets`` into a strictly ascending list of token counts."""
+    buckets = [int(x) for x in spec.split(",")]
+    if buckets != sorted(set(buckets)):
+        raise argparse.ArgumentTypeError(
+            f"--prefill-buckets must be strictly ascending, got {buckets}"
+        )
+    return buckets
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Qwen/Qwen3.5-2B")
@@ -66,15 +77,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-tokens", type=int, default=128)
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument(
-        "--prefill-chunk",
-        type=int,
+        "--prefill-buckets",
+        type=prefill_buckets,
         default=None,
-        help="prefill token bucket, i.e. max_num_batched_tokens. Defaults to "
-        "--max-model-len, which compiles one graph that covers any prompt. A "
-        "smaller value shrinks the compiled tile, and with it the SBUF spill, at "
-        "the cost of running the prefill graph ceil(prompt/chunk) times per "
-        'request. See README.md "Sizing the prefill bucket": 1024 rather than '
-        "2048 takes 27B's TTFT from 789 to 284 ms",
+        metavar="N[,N...]",
+        help="prefill token buckets, i.e. num_batched_tokens_buckets, with "
+        "max_num_batched_tokens taken from the largest. Left unset the plugin's "
+        "own default applies (powers of two from 128 up to --max-model-len), "
+        "which is usually what you want. Pinning a single value compiles just "
+        "one prefill graph -- quickest to compile, but every prompt then pads up "
+        'to it. See README.md "Sizing the prefill bucket"',
     )
     # Both needed for 27B on a trn2.3xlarge. HBM is 24 GB per *logical core*,
     # not 96 GB pooled, and at the default gmu the planner fills the leftover
@@ -215,7 +227,9 @@ async def main_async(args) -> None:
         model=args.model,
         **extra,
         max_model_len=args.max_model_len,
-        max_num_batched_tokens=args.prefill_chunk or args.max_model_len,
+        max_num_batched_tokens=(
+            args.prefill_buckets[-1] if args.prefill_buckets else args.max_model_len
+        ),
         max_num_seqs=args.max_num_seqs,
         tensor_parallel_size=args.tensor_parallel_size,
         enable_prefix_caching=False,
@@ -223,9 +237,11 @@ async def main_async(args) -> None:
         additional_config={
             "neuron_config": {
                 "quantization": "bf16",
-                "num_batched_tokens_buckets": [
-                    args.prefill_chunk or args.max_model_len
-                ],
+                **(
+                    {"num_batched_tokens_buckets": args.prefill_buckets}
+                    if args.prefill_buckets
+                    else {}
+                ),
                 "num_seqs_buckets": [args.max_num_seqs],
                 "on_device_sampling_config": {"all_greedy": True},
                 # See run.py: the runner's default --modular-flow-mac-threshold
