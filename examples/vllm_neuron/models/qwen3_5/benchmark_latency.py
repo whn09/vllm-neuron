@@ -13,6 +13,12 @@ want to measure -- measure batch 1 and batch 4 in separate processes rather than
 configuring several buckets (supplying several ``num_seqs_buckets`` hangs, see
 README.md "Known limitations").
 
+``--prefill-chunk`` sizes the prefill token bucket independently of
+``--max-model-len``. Left unset it follows ``--max-model-len``, which compiles one
+prefill graph covering any acceptable prompt -- convenient, but it oversizes the
+tile for shorter prompts and on 27B that costs a factor of 2.8 in TTFT. See
+README.md "Sizing the prefill bucket".
+
 Usage:
 
     python examples/vllm_neuron/models/qwen3_5/benchmark_latency.py \
@@ -59,6 +65,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-tokens", type=int, default=1024)
     parser.add_argument("--output-tokens", type=int, default=128)
     parser.add_argument("--iterations", type=int, default=3)
+    parser.add_argument(
+        "--prefill-chunk",
+        type=int,
+        default=None,
+        help="prefill token bucket, i.e. max_num_batched_tokens. Defaults to "
+        "--max-model-len, which compiles one graph that covers any prompt. A "
+        "smaller value shrinks the compiled tile, and with it the SBUF spill, at "
+        "the cost of running the prefill graph ceil(prompt/chunk) times per "
+        'request. See README.md "Sizing the prefill bucket": 1024 rather than '
+        "2048 takes 27B's TTFT from 789 to 284 ms",
+    )
     # Both needed for 27B on a trn2.3xlarge. HBM is 24 GB per *logical core*,
     # not 96 GB pooled, and at the default gmu the planner fills the leftover
     # budget with recurrent-state blocks until neuronx-cc rejects the graph
@@ -198,7 +215,7 @@ async def main_async(args) -> None:
         model=args.model,
         **extra,
         max_model_len=args.max_model_len,
-        max_num_batched_tokens=args.max_model_len,
+        max_num_batched_tokens=args.prefill_chunk or args.max_model_len,
         max_num_seqs=args.max_num_seqs,
         tensor_parallel_size=args.tensor_parallel_size,
         enable_prefix_caching=False,
@@ -206,7 +223,9 @@ async def main_async(args) -> None:
         additional_config={
             "neuron_config": {
                 "quantization": "bf16",
-                "num_batched_tokens_buckets": [args.max_model_len],
+                "num_batched_tokens_buckets": [
+                    args.prefill_chunk or args.max_model_len
+                ],
                 "num_seqs_buckets": [args.max_num_seqs],
                 "on_device_sampling_config": {"all_greedy": True},
                 # See run.py: the runner's default --modular-flow-mac-threshold

@@ -106,6 +106,43 @@ mismatch on the *first* token is a prefill bug; later divergence is expected,
 because bf16 and an independent implementation eventually disagree on a
 near-tie and greedy decoding amplifies it.
 
+## Sizing the prefill bucket
+
+`--prefill-chunk` sets `max_num_batched_tokens`. Left unset it follows
+`--max-model-len`, which compiles a single prefill graph that covers any prompt
+the model can accept. That is convenient, and on 27B it costs a factor of 2.8 in
+TTFT.
+
+With `max_model_len` 2048 and a 1024-token prompt, the graph is sized for twice
+the work the request does and the tiles stop fitting the 24 MB SBUF. A device
+profile of that graph attributes **78% of all HBM reads to SBUF spill reloads**
+-- 108.7 GB of reloads against 13.5 GB/rank of weights, with spill making up 81%
+of total HBM traffic. Sizing the bucket to the prompt removes nearly all of it:
+
+| `--prefill-chunk` | TTFT (27B, batch 1, 1024-token prompt) |
+|---|---|
+| 2048 (= `max_model_len`, the default) | 789 ms |
+| **1024** | **284 ms** |
+| 512 | 287 ms |
+
+TPOT is unchanged at 48.5 ms and the decode NEFF is byte-identical, so this
+touches prefill only. Compile time falls with the bucket as well -- roughly half
+at 1024 and roughly a quarter at 512 in the same sweep -- because the prefill
+graph dominates the 27B compile.
+
+Two things worth knowing before picking a value:
+
+- 1024 on a 1024-token prompt is a *single* chunk, so the win above is not
+  chunked prefill. It is the bucket matching the request, and the lesson is to
+  size the bucket to the prompts actually served rather than to `max_model_len`.
+- Chunking is cheap when it does happen: 2x512 costs 2.6% more graph time than
+  1x1024 (255.9 vs 249.5 ms), so a 512-1024 bucket stays reasonable for prompts
+  longer than one chunk. 512 is the floor -- Neuron accepts
+  `[512, 1024, 2048, 4096, 8192]` and rejects anything else.
+
+Neuron supports chunking prefills at batch size 1 only; it logs this and will
+not mix prefill and decode in one batch. Every number above is batch 1.
+
 ## Known limitations
 
 Stated plainly rather than left to be discovered:
