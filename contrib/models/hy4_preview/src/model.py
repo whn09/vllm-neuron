@@ -77,6 +77,58 @@ DEBUG_LAYERS = {int(x) for x in os.environ.get("HY4_DEBUG_LAYERS", "0").split(",
 # DSA mask all-gather a local repeat; "attn"/"moe" replace that sub-block's
 # output with zeros (attention then writes no KV and selects nothing).
 PERF_SKIP = {x for x in os.environ.get("HY4_PERF_SKIP", "").split(",") if x}
+# ``HY4_DEC_CP=1``: decode attention sharded by KEY across the TP ranks instead
+# of replicated per head (``HYV4Attention.forward_decode_cp``). Off by default;
+# recommended on (see the README).
+DEC_CP = os.environ.get("HY4_DEC_CP", "0") == "1"
+
+# Prefill prefix bound from ``kv_segment_size`` (see ``prefill_span_bound``).
+# Inert unless neuron_config.kv_segment_size_buckets has more than one entry;
+# ``HY4_PREFILL_SPAN_KVSEG=0`` turns it off.
+PREFILL_SPAN_KVSEG = os.environ.get("HY4_PREFILL_SPAN_KVSEG", "1") == "1"
+# Dtype of the prefill DSA-selection all-gather: "bf16" (the PR's) or "uint8"
+# (half the bytes; 0/1 values, so exact either way). Opt-in until it has run on
+# device: a uint8 collective is not exercised elsewhere in this model.
+SEL_GATHER_DTYPE = os.environ.get("HY4_SEL_GATHER_DTYPE", "bf16")
+if SEL_GATHER_DTYPE not in ("bf16", "uint8"):
+    raise ValueError(f"HY4_SEL_GATHER_DTYPE must be bf16 or uint8, got {SEL_GATHER_DTYPE!r}")
+
+
+def prefill_span_bound(kv_segment_size: int, kv_segment_size_buckets) -> int | None:
+    """Upper bound on ``cached_seq_len`` implied by a prefill graph's ``kv_segment_size``.
+
+    The runner picks ``kv_segment_size`` with ``pick_kv_segment_size``, which
+    returns the smallest configured bucket that holds the whole prefix in one
+    segment, and the largest bucket for any prefix longer than that. So a
+    segment size *below* the largest bucket means ``cached_seq_len <=
+    kv_segment_size``; the largest bucket bounds nothing. ``None`` = no bound.
+    ``check_prefill_span_bound`` verifies this against the plugin's picker.
+    """
+    buckets = sorted(kv_segment_size_buckets or [])
+    if not PREFILL_SPAN_KVSEG or len(buckets) < 2 or not kv_segment_size:
+        return None
+    if kv_segment_size >= buckets[-1]:
+        return None
+    # Rounded up to whole ``ATTN_KEY_BLOCK``s, so the online softmax sees the
+    # same key blocks as the full span (only fully masked ones are dropped)
+    # and the output is bitwise identical, not just equal up to rounding.
+    return -(-int(kv_segment_size) // ATTN_KEY_BLOCK) * ATTN_KEY_BLOCK
+
+
+def check_prefill_span_bound(kv_segment_size_buckets, limit: int = 1 << 17) -> bool:
+    """True if the plugin's ``pick_kv_segment_size`` honours ``prefill_span_bound``."""
+    buckets = sorted(kv_segment_size_buckets or [])
+    if len(buckets) < 2:
+        return True
+    try:
+        from vllm_neuron.utils.bucket_utils import pick_kv_segment_size
+    except ImportError:
+        return False
+    for cached in range(0, limit + 1):
+        bound = prefill_span_bound(pick_kv_segment_size(cached, buckets), buckets)
+        if bound is not None and cached > bound:
+            return False
+    return True
 
 
 def _all_reduce(group, t: torch.Tensor) -> torch.Tensor:
@@ -96,7 +148,13 @@ def _capture(layer_idx: int, name: str, tensor: torch.Tensor) -> None:
         capture_tensor(f"hy4.l{layer_idx}.{name}", tensor)
 
 
-from .moe import HYV4MLP, HYV4MoE
+from .moe import (
+    FORMAT_FP8_ROW,
+    FORMAT_MXFP8,
+    HYV4MLP,
+    HYV4MoE,
+    require_mx_platform,
+)
 
 HF_PREFIX = "model"
 
@@ -267,15 +325,37 @@ def select_topk(scores: torch.Tensor, visible: torch.Tensor, k: int) -> torch.Te
     result is exactly the top-k up to keys tied with the k-th score.
     """
     s = scores.float()
+    return visible & (s >= topk_threshold(s, visible, k))
+
+
+def topk_threshold(
+    s: torch.Tensor,
+    visible: torch.Tensor,
+    k: int,
+    extra: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``select_topk``'s per-row threshold ``lo`` ``[rows, 1]`` over fp32 ``s``.
+
+    It depends only on the multiset of visible scores per row (max, min and
+    counts), not on their order, so it can run over keys gathered from ranks
+    in any order (``forward_decode_cp``). ``extra`` ``[rows, 1]`` is one more
+    always-visible score, counted as if it were a column of ``s`` (so callers
+    need not concatenate it).
+    """
     hi = s.masked_fill(~visible, -_BIG).amax(dim=-1, keepdim=True)
     lo = s.masked_fill(~visible, _BIG).amin(dim=-1, keepdim=True)
+    if extra is not None:
+        hi = torch.maximum(hi, extra)
+        lo = torch.minimum(lo, extra)
     for _ in range(TOPK_BISECTION_STEPS):
         mid = (lo + hi) * 0.5
         count = ((s >= mid) & visible).float().sum(dim=-1, keepdim=True)
+        if extra is not None:
+            count = count + (extra >= mid).float()
         up = count >= k
         lo = torch.where(up, mid, lo)
         hi = torch.where(up, hi, mid)
-    return visible & (s >= lo)
+    return lo
 
 
 def _zero_beyond(ctx: torch.Tensor, limit: torch.Tensor) -> torch.Tensor:
@@ -305,6 +385,20 @@ def _zero_beyond(ctx: torch.Tensor, limit: torch.Tensor) -> torch.Tensor:
     keep = (limit.float().view(rows, 1) - positions.view(1, ctx_len)) > half
     keep = keep.to(ctx.dtype)
     return ctx * (keep.unsqueeze(-1) if ctx.dim() == 3 else keep.view(ctx_len, 1))
+
+
+def _zero_beyond_at(
+    ctx: torch.Tensor, limit: torch.Tensor, key_pos: torch.Tensor
+) -> torch.Tensor:
+    """``_zero_beyond`` for ``ctx [rows, n, D]`` whose keys sit at ``key_pos [n]``.
+
+    Same separately computed float predicate (see ``_zero_beyond``), for a
+    rank's key shard whose positions are not ``arange(n)``.
+    """
+    rows, n = ctx.shape[0], ctx.shape[1]
+    half = torch.full((1, 1), 0.5, dtype=torch.float32, device=ctx.device)
+    keep = (limit.float().view(rows, 1) - key_pos.float().view(1, n)) > half
+    return ctx * keep.to(ctx.dtype).unsqueeze(-1)
 
 
 class HYV4Indexer(nn.Module):
@@ -395,6 +489,7 @@ class HYV4Attention(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.layer_name = f"layers.{layer_idx}.self_attn"
+        self.neuron_config = config.neuron_config
         self.dtype = config.torch_dtype
         self.tp_group = get_tp_group()
         self.world_size = self.tp_group.world_size
@@ -715,6 +810,10 @@ class HYV4Attention(nn.Module):
                 f"layer ran before it"
             )
         if metadata["max_query_len"] <= metadata["decode_token_threshold"]:
+            if DEC_CP and self.cp_supported(metadata["block_table_tensor"].shape[1]):
+                return self.forward_decode_cp(
+                    x, positions, position_embeddings, metadata, selected, rank
+                )
             rows = metadata["block_table_tensor"].shape[0]
             # See forward_decode_split for why the batch picks the form.
             split = rows == 1 or rows >= 16
@@ -780,7 +879,11 @@ class HYV4Attention(nn.Module):
         # bf16 for the collective, which bool may not be on every backend; back
         # by a cast, not ``> 0.5``: a bf16-vs-Python-float compare lowers to an
         # f64 constant, which neuronx-cc rejects (NCC_ESPP004).
-        gathered = _all_gather(self.tp_group, local.to(torch.bfloat16), 0, world)
+        # ``HY4_SEL_GATHER_DTYPE=uint8`` halves the bytes; the 0/1 values are
+        # cast to bf16 after the collective, so ``ordered`` is identical.
+        wire = torch.uint8 if SEL_GATHER_DTYPE == "uint8" else torch.bfloat16
+        gathered = _all_gather(self.tp_group, local.to(wire), 0, world)
+        gathered = gathered.to(torch.bfloat16)
         if "collectives" in PERF_SKIP:
             sources = torch.arange(world, dtype=torch.float32, device=iq.device)
         else:
@@ -817,6 +920,19 @@ class HYV4Attention(nn.Module):
 
         prior = metadata["cached_seq_len"].reshape(1, 1).to(torch.long)
         block_table = metadata["block_table_tensor"][:1]
+        # Static prefix bound for this graph (``prefill_span_bound``): keys past
+        # it are past ``cached_seq_len``, i.e. masked, so dropping them is exact.
+        # The plugin's ``prefill_context_length_buckets`` instead trims the
+        # table itself, which ``_gather`` already follows.
+        nc = self.neuron_config
+        bound = prefill_span_bound(
+            metadata.get("kv_segment_size", 0),
+            getattr(nc, "kv_segment_size_buckets", None) if nc is not None else None,
+        )
+        if bound is not None:
+            blocks = -(-bound // self._block_size())
+            if blocks < block_table.shape[1]:
+                block_table = block_table[:, :blocks]
         live = torch.ones(1, 1, dtype=torch.bool, device=x.device)
         ctx = self._gather(block_table, live)[0]  # [ctx_len, 704]
         ctx_len = ctx.shape[0]
@@ -967,6 +1083,151 @@ class HYV4Attention(nn.Module):
         _capture(self.layer_idx, "attn_out", out)
         return out, selected
 
+    # ── decode, sharded by key (HY4_DEC_CP=1) ────────────────────────────
+    #
+    # No torch.cat / torch.stack anywhere in this path (an earlier version
+    # failed neuronx-cc with NCC_IFML902 "FlattenMacroLoop ... Cannot remove an
+    # edge" on an aten cat inside it): the current token's key is handled as
+    # separate terms, and each collective carries one unpadded tensor.
+
+    def cp_supported(self, width: int) -> bool:
+        """Key-sharded decode needs the block table to split evenly over ranks."""
+        return self.world_size > 1 and width % self.world_size == 0
+
+    def _cp_pick(self, r: torch.Tensor, dev) -> torch.Tensor:
+        """``[nh, world * nh]`` 0/1 matrix taking this rank's heads out of a
+        head axis in all-gather block order (not tp-rank order on Trn2; the
+        ranks are gathered too, as in ``_select_prefill``)."""
+        world, nh = self.world_size, self.num_heads
+        if "collectives" in PERF_SKIP:
+            sources = torch.arange(world, dtype=torch.float32, device=dev)
+        else:
+            sources = self.tp_group.all_gather(r.reshape(1).to(torch.float32), dim=0)
+        at_me = (sources.view(world) == r.reshape(1).to(torch.float32)).to(torch.float32)
+        eye = torch.eye(nh, dtype=torch.float32, device=dev)
+        return (eye.view(nh, 1, nh) * at_me.view(1, world, 1)).reshape(nh, world * nh)
+
+    def forward_decode_cp(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        position_embeddings: tuple,
+        metadata: dict,
+        selected: tuple | None,
+        rank: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, tuple]:
+        """Decode attention sharded by KEY across the TP ranks; same result as
+        ``forward_decode_split``.
+
+        The cache is still replicated, but rank ``r`` gathers only block-table
+        columns ``[r * nb, (r + 1) * nb)`` (``nb = width / world``), i.e. key
+        positions ``[r * n, (r + 1) * n)``, and handles them for ALL heads.
+        The current token's own key is not in the gather; its query, entry
+        and therefore its scores are identical on every rank, so it is added
+        as a separate term (once, after the merge), never concatenated.
+
+        1. all-gather the absorbed queries ``[reqs, nh, 576]`` -> all heads;
+        2. full-indexer layers: all-gather the local indexer scores
+           ``[reqs, n]`` (invisible at ``-_BIG``); the global top-k threshold
+           is ``select_topk``'s bisection over them plus the own-token score
+           as an always-visible extra term. It depends only on the multiset of
+           scores, so the gather order does not matter, and it is bit-identical
+           on all ranks. -> local mask ``[reqs, n]`` and own-token bit
+           ``[reqs, 1]``. Also gathers the ranks for the head pick (step 5).
+           Shared layers reuse all three (``selected`` is a tuple here);
+        3. local scores ``[reqs, heads, n]``; all-gather the per-head local
+           maxima; ``M`` = max over ranks and the selected own-token score;
+        4. all-reduce the unnormalised numerators ``[reqs, heads, 512]`` and
+           denominators ``[reqs, heads]``, then add the own-token term;
+        5. take this rank's heads (``_cp_pick``), fold the sink in once
+           (rescaling to ``max(M, sink)``), then ``w_uv`` / gate / ``o_proj``.
+        """
+        cos, sin = position_embeddings
+        block_table = metadata["block_table_tensor"]
+        num_reqs, width = block_table.shape
+        world, nh = self.world_size, self.num_heads
+        dev = x.device
+        x = x.to(self.dtype)
+        query, entry, gate, q_resid = self._project(x, cos, sin)
+        self._write_kv(entry, metadata)
+
+        if rank is None:
+            rank = torch.tensor(self.tp_group.rank_in_group, device=dev)
+        r = rank.reshape(1).to(torch.long)
+        nb = width // world
+        shard = nb * self._block_size()
+        cols = r * nb + torch.arange(nb, device=dev)
+        local_bt = torch.index_select(block_table, 1, cols)
+        live_rows = (metadata["slot_mapping"].view(num_reqs, -1)[:, 0] > 0).view(-1, 1)
+        ctx = self._gather(local_bt, live_rows)  # [reqs, shard, 704]
+        key_pos = r * shard + torch.arange(shard, device=dev)  # [shard]
+        limit = positions.view(num_reqs, 1)
+        in_prefix = key_pos.view(1, shard) < limit  # [reqs, shard]
+        ctx = _zero_beyond_at(ctx, limit, key_pos)
+        own = entry.to(ctx.dtype)  # [reqs, 704], the same on every rank
+
+        if self.indexer is not None:
+            iq, iw = self.indexer.queries(q_resid, x, cos, sin)  # [reqs, 32, 128]
+            s_ctx = torch.relu((iq @ ctx[..., self.index_slice].transpose(1, 2)).float())
+            idx_ctx = (iw.unsqueeze(1) @ s_ctx).squeeze(1)  # [reqs, shard]
+            s_own = torch.relu(
+                torch.einsum("rhd,rd->rh", iq, own[:, self.index_slice]).float()
+            )
+            idx_own = (iw * s_own).sum(dim=-1, keepdim=True)  # [reqs, 1]
+            masked = idx_ctx.masked_fill(~in_prefix, -_BIG)
+            every = _all_gather(self.tp_group, masked, 1, world)  # [reqs, world*shard]
+            half = torch.full((1, 1), -0.5 * _BIG, dtype=torch.float32, device=dev)
+            lo = topk_threshold(every, every > half, self.index_topk, idx_own)
+            selected = (in_prefix & (idx_ctx >= lo), idx_own >= lo, self._cp_pick(r, dev))
+        sel_ctx, sel_own, pick = selected
+
+        # 1. every head's absorbed query (order: all-gather blocks).
+        q_all = _all_gather(self.tp_group, query.float(), 1, world)  # [reqs, heads, 576]
+
+        # 3. local scores, global max.
+        lat = ctx[..., self.latent_slice]  # [reqs, shard, 576]
+        own_lat = own[:, self.latent_slice]  # [reqs, 576]
+        scores = (q_all @ lat.float().transpose(1, 2)) * self.scaling  # [reqs, heads, shard]
+        # A finite floor (see _attend_blocked): a rank may have no selected key.
+        floor = -1.0e30
+        scores = scores.masked_fill(~sel_ctx.unsqueeze(1), floor)
+        a = torch.einsum("rhc,rc->rh", q_all, own_lat.float()) * self.scaling
+        a = a.masked_fill(~sel_own, floor)  # [reqs, heads]
+        m_loc = scores.amax(dim=-1)  # [reqs, heads]
+        m_all = _all_gather(self.tp_group, m_loc.unsqueeze(0), 0, world).amax(dim=0)
+        m = torch.maximum(m_all, a)
+
+        # 4. unnormalised local partials, merged across ranks.
+        p = torch.exp(scores - m.unsqueeze(-1))
+        den = p.sum(dim=-1)  # [reqs, heads]
+        rank_v = self.kv_lora_rank
+        # Contract the whole 576-wide row and slice the small output, not the
+        # gathered latent (a strided view of it spills).
+        num = (p.to(self.dtype) @ lat).float()[..., :rank_v]  # [reqs, heads, 512]
+        pa = torch.exp(a - m)  # [reqs, heads]; 0 when the own key is unselected
+        own_v = own_lat[:, :rank_v].float()  # [reqs, 512]
+        m_mine = torch.einsum("jh,rh->rj", pick, m)  # [reqs, nh]
+        pa_mine = torch.einsum("jh,rh->rj", pick, pa)
+        num_all = _all_reduce(self.tp_group, num)
+        den_all = _all_reduce(self.tp_group, den)
+        num_mine = torch.einsum("jh,rhc->rjc", pick, num_all)  # [reqs, nh, 512]
+        den_mine = torch.einsum("jh,rh->rj", pick, den_all)  # [reqs, nh]
+        num_mine = num_mine + pa_mine.unsqueeze(-1) * own_v.unsqueeze(1)
+        den_mine = den_mine + pa_mine
+
+        # 5. the sink joins once, as in _attend_blocked.
+        sink = self.sinks.float().view(1, nh)
+        m_f = torch.maximum(m_mine, sink)
+        scale = torch.exp(m_mine - m_f)
+        o_lat = num_mine * scale.unsqueeze(-1) / (
+            den_mine * scale + torch.exp(sink - m_f)
+        ).unsqueeze(-1)  # [reqs, nh, 512]
+        out = self._finish(o_lat, gate)
+        _capture(self.layer_idx, "attn_in", x)
+        _capture(self.layer_idx, "selected", sel_ctx.to(torch.bfloat16))
+        _capture(self.layer_idx, "attn_out", out)
+        return out, selected
+
 
 # ── Decoder ──────────────────────────────────────────────────────────────
 
@@ -1082,6 +1343,7 @@ class HYV4TextModel(nn.Module):
 def checkpoint_mappings(config: HYV4Config) -> dict[str, str]:
     """Port parameter name -> converted-checkpoint key, for every loaded parameter."""
     m: dict[str, str] = {}
+    mx_experts = (config.neuron_quantization or {}).get("format") == FORMAT_MXFP8
     for i in range(config.num_hidden_layers):
         hf, ours = f"{HF_PREFIX}.layers.{i}", f"model.layers.{i}"
         m[f"{ours}.input_layernorm.weight"] = f"{hf}.input_layernorm.weight"
@@ -1117,7 +1379,11 @@ def checkpoint_mappings(config: HYV4Config) -> dict[str, str]:
             m[f"{mlp}.e_score_correction_bias"] = f"{hm}.gate.e_score_correction_bias"
             m[f"{mlp}.experts_gate_up_weight"] = f"{hm}.experts.gate_up_proj"
             m[f"{mlp}.experts_gate_up_scale"] = f"{hm}.experts.gate_up_proj_scale"
-            m[f"{mlp}.experts_down_weight"] = f"{hm}.experts.down_proj_t"
+            # fp8-row checkpoints store the down weight transposed; the MXFP8
+            # expert checkpoint keeps the published [E, H, I] ``down_proj``.
+            m[f"{mlp}.experts_down_weight"] = (
+                f"{hm}.experts.down_proj" if mx_experts else f"{hm}.experts.down_proj_t"
+            )
             m[f"{mlp}.experts_down_scale"] = f"{hm}.experts.down_proj_scale"
             shared, hs = f"{mlp}.shared_experts", f"{hm}.shared_experts"
         else:
@@ -1163,6 +1429,16 @@ class HYV4ForCausalLM(nn.Module):
         self.rank = self.tp_group.rank_in_group
 
         nc = config.neuron_config
+        seg_buckets = getattr(nc, "kv_segment_size_buckets", None) if nc else None
+        if PREFILL_SPAN_KVSEG and seg_buckets and len(seg_buckets) > 1:
+            # The bound trusts pick_kv_segment_size's rule; refuse to run if the
+            # installed plugin picks differently (set HY4_PREFILL_SPAN_KVSEG=0).
+            if not check_prefill_span_bound(seg_buckets):
+                raise RuntimeError(
+                    f"kv_segment_size_buckets={seg_buckets}: the plugin's "
+                    "pick_kv_segment_size does not bound cached_seq_len as "
+                    "prefill_span_bound assumes; set HY4_PREFILL_SPAN_KVSEG=0"
+                )
 
         self.model = self.text_model_cls(config)
 
@@ -1291,13 +1567,19 @@ class HYV4ForCausalLM(nn.Module):
             raise NotImplementedError("Hy4 is a text-only model")
         config = HYV4Config.from_configs(hf_config, neuron_config=text_neuron_config)
         quant = config.neuron_quantization or {}
-        if quant.get("format") != "fp8_row_experts":
+        fmt = quant.get("format")
+        if fmt == FORMAT_MXFP8:
+            # Native MXFP8 experts run nkilib MX moe_tkg, which is Trn3-only.
+            # Checked once here, outside any traced region.
+            require_mx_platform()
+        elif fmt != FORMAT_FP8_ROW:
             raise ValueError(
                 "HYV4ForCausalLM on Neuron loads the Trn2 fp8 checkpoint written by "
                 "contrib/models/hy4_preview/scripts/convert_mxfp8_to_neuron_fp8.py "
                 "(config.json has no neuron_quantization.format=fp8_row_experts). "
                 "The bf16 checkpoint does not fit one trn2.48xlarge, and the "
-                "published MXFP8 one has no Trn2 kernel."
+                "published MXFP8 one has no Trn2 kernel. On Trn3, convert with "
+                "--keep-mx-experts (format mxfp8_experts)."
             )
         return cls(config)
 
